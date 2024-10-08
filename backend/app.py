@@ -27,7 +27,6 @@ def get_ollama_response(user_message):
     global negotiation_attempts, LAST_NEGOTIATED_PRICE
     
     logging.info(f"last negotiated price: {LAST_NEGOTIATED_PRICE}")
-
     conversation_history.append({"role": "user", "content": user_message})
     user_offer = extract_price_from_message(user_message)
 
@@ -75,8 +74,8 @@ def get_ollama_response(user_message):
         response = requests.post(OLLAMA_API_URL, json=payload)
         response.raise_for_status()
         bot_response = response.json()
-        bot_message = bot_response['message'].strip()
 
+        bot_message = bot_response['message']['content'].strip()
         bot_price = extract_price_from_message(bot_message)
         logging.info(f"Price extracted from bot response: {bot_price}")
 
@@ -127,15 +126,65 @@ def finalize_negotiation(last_price, close_offer=False):
 
 def classify_intent(user_message=None, bot_message=None):
     """
-    Classify the intent based on user and bot messages.
+    Classify the intent based on both user and bot messages using the Llama model.
     """
-    # Simple classification logic
-    if "accept" in user_message.lower():
-        return "acceptance"
-    elif "no" in user_message.lower() or "reject" in user_message.lower():
-        return "rejection"
-    return "negotiation"
+    # Ensure both messages are provided
+    if not user_message or not bot_message:
+        return "unknown"
 
+    # Add both user and bot messages to the payload for the Llama model to classify
+    conversation_history = [
+        {"role": "system", "content": f"Classify the user's intent in a price negotiation. Consider both the {user_message} and the {bot_message}. Determine if the user accepts, rejects, or is still negotiate. If the {user_message} contains a counter price then it should be considered a negotiation. If the user accepts the price then it's an acceptance. Only respond with a acceptance, rejection, negotiation and unclear."},
+        {"role": "user", "content": user_message},
+        {"role": "assistant", "content": bot_message}
+    ]
+
+    payload = {
+        "model": "llama3.2",  # Replace with the correct model name
+        "stream": False,
+        "messages": conversation_history
+    }
+
+    try:
+        # Send the classification request to the Llama API
+        response = requests.post(OLLAMA_API_URL, json=payload)
+        response.raise_for_status()
+
+        # Parse the response from the Llama model
+        bot_response = response.json()
+
+        # Extract the intent from the bot's response
+        if 'message' in bot_response and 'content' in bot_response['message']:
+            classified_intent = bot_response['message']['content'].strip().lower()
+
+            # Map the response to predefined intents
+            if "acceptance" in classified_intent:
+                return "acceptance"
+            elif "rejection" in classified_intent:
+                return "rejection"
+            elif "negotiation" in classified_intent:
+                return "negotiation"
+            else:
+                return "unknown"
+
+    except Exception as e:
+        logging.error(f"Error classifying intent with Ollama API: {e}")
+        return "unknown"
+
+def initialize_ollama_response(user_message):
+    global negotiation_attempts, LAST_NEGOTIATED_PRICE
+    conversation_history.clear()
+    negotiation_attempts = 0
+    LAST_NEGOTIATED_PRICE = ACTUAL_PRICE  # Reset negotiator's offer
+    first_discounted_price = generate_random_discount(ACTUAL_PRICE)
+    conversation_history.append({
+        "role": "system",
+        "content": f"You are a smart and suave price negotiator who doesn't get detracted from his purpose. You are selling a set of 4 wheels for {ACTUAL_PRICE} {CURRENCY}. Start by always offering a price of {first_discounted_price} first. You should negotiate down to no less than {MIN_PRICE} {CURRENCY} after multiple attempts. The user can offer up to 5 times. If the user's offer is within 10% of the user's price, immediately accept. if the offer is more than the one you offered before, ask te user if they made a typo or something. Go a bit lower the next time you offer a price. Don't mention the price that the user offered and never go below what the user offered. Always offer price in {CURRENCY} and don't mention the discount amount. If the user accepts your price just accept it"
+    })
+    logging.info(f"Ollama Initialized: {LAST_NEGOTIATED_PRICE}")
+
+    return get_ollama_response(user_message)
+    
 def generate_random_code():
     """Generates a random 6-digit discount code."""
     return ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))
@@ -158,8 +207,14 @@ def chatbot_response():
 def chatbot_initialize():
     data = request.get_json()
     user_message = data['message']
-    bot_response = get_ollama_response(user_message)  # Adjust to initialize with Ollama
+    bot_response = initialize_ollama_response(user_message)  # Adjust to initialize with Ollama
     return jsonify(bot_response)
+
+def generate_random_discount(original_price):
+    discount_percentage = random.uniform(2, 5)
+    discount = round(discount_percentage, 0)
+    discounted_price = original_price * (1 - discount / 100)
+    return discounted_price
 
 if __name__ == '__main__':
     app.run(debug=True)
