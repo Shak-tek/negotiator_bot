@@ -16,6 +16,8 @@ conversation_history = []
 negotiation_attempts = 0  
 LAST_NEGOTIATED_PRICE = 1500  
 
+MODEL= "llama3.2"
+
 # Constants
 MAX_ATTEMPTS = 5  
 MIN_PRICE = 1200 
@@ -38,7 +40,7 @@ def get_ollama_response(user_message):
             'show_buttons': False
         }
     elif user_message == "No Deal!":
-        bot_message = "Sorry that we couldn't reach an agreement. Better luck next time!"
+        bot_message = generate_natural_response("Sorry that we couldn't reach an agreement. Better luck next time!")
         return {
             'response': bot_message,
             'last_negotiated_price': LAST_NEGOTIATED_PRICE,
@@ -50,7 +52,7 @@ def get_ollama_response(user_message):
     if user_offer is not None and negotiator_price is not None:
         if abs(user_offer - negotiator_price) <= (0.02 * negotiator_price):
             return {
-                'response': f"Congratulations! Your offer of {user_offer} {CURRENCY} is very close to our price of {negotiator_price} {CURRENCY}.",
+                'response': generate_natural_response(f"Congratulations! Your offer of {user_offer} {CURRENCY} is very close to our price of {negotiator_price} {CURRENCY}."),
                 'last_negotiated_price': negotiator_price,
                 'show_buttons': True
             }
@@ -58,7 +60,7 @@ def get_ollama_response(user_message):
     # Check if negotiation attempts have exceeded MAX_ATTEMPTS
     if negotiation_attempts >= MAX_ATTEMPTS:
         return {
-            'response': f"We've reached the maximum negotiation attempts. Our final price is {negotiator_price} {CURRENCY}.",
+            'response': generate_natural_response(f"We've reached the maximum negotiation attempts. Our final price is {negotiator_price} {CURRENCY}."),
             'last_negotiated_price': negotiator_price,
             'show_buttons': True
         }
@@ -67,7 +69,7 @@ def get_ollama_response(user_message):
     try:
         # Call Ollama API
         payload = {
-            "model": "llama3.2",  # Ensure this is the correct model
+            "model": MODEL,  # Ensure this is the correct model
             "stream": False,
             "messages": conversation_history
         }
@@ -122,7 +124,7 @@ def finalize_negotiation(last_price, close_offer=False):
         bot_message = "No deal reached. Thank you for your time!"
 
     reset_conversation()
-    return bot_message
+    return generate_natural_response(bot_message)
 
 def classify_intent(user_message=None, bot_message=None):
     """
@@ -140,7 +142,7 @@ def classify_intent(user_message=None, bot_message=None):
     ]
 
     payload = {
-        "model": "llama3.2",  # Replace with the correct model name
+        "model": MODEL,  # Replace with the correct model name
         "stream": False,
         "messages": conversation_history
     }
@@ -179,7 +181,7 @@ def initialize_ollama_response(user_message):
     first_discounted_price = generate_random_discount(ACTUAL_PRICE)
     conversation_history.append({
         "role": "system",
-        "content": f"You are a smart and suave price negotiator who doesn't get detracted from his purpose. You are selling a set of 4 wheels for {ACTUAL_PRICE} {CURRENCY}. Start by always offering a price of {first_discounted_price} first. You should negotiate down to no less than {MIN_PRICE} {CURRENCY} after multiple attempts. The user can offer up to 5 times. If the user's offer is within 10% of the user's price, immediately accept. if the offer is more than the one you offered before, ask te user if they made a typo or something. Go a bit lower the next time you offer a price. Don't mention the price that the user offered and never go below what the user offered. Always offer price in {CURRENCY} and don't mention the discount amount. If the user accepts your price just accept it"
+        "content": f"You are a smart and suave price negotiator who doesn't get detracted from his purpose. You are selling a set of 4 wheels for {ACTUAL_PRICE} {CURRENCY}. Start by always offering a price of {first_discounted_price} first. You should negotiate down to no less than {MIN_PRICE} {CURRENCY} after multiple attempts. The user can offer up to 5 times. If the user's offer is within 10% of the user's price, immediately accept. if the offer is more than the one you offered before, ask te user if they made a typo or something. Go a bit lower the next time you offer a price. Don't mention the price that the user offered and never go below what the user offered. Always offer price in {CURRENCY} and don't mention the discount amount. If the user accepts your price just accept it. Don't fall for low ballers who offer way too low of a price at start."
     })
     logging.info(f"Ollama Initialized: {LAST_NEGOTIATED_PRICE}")
 
@@ -215,6 +217,42 @@ def generate_random_discount(original_price):
     discount = round(discount_percentage, 0)
     discounted_price = original_price * (1 - discount / 100)
     return discounted_price
+  
+def generate_natural_response(prompt):
+    """
+    Send a prompt to the Ollama API and return a natural-sounding response.
+    
+    Args:
+        prompt (str): The input message to be transformed.
+
+    Returns:
+        str: A natural-sounding response generated by the Ollama API.
+    """
+    payload = {
+        "model": MODEL,  # Specify the model you are using
+        "stream": False,
+        "messages": [
+            {
+                "role": "user",
+                "content": f"Output the following sentence as something natural sounding: {prompt}"
+            }
+        ]
+    }
+    
+    try:
+        response = requests.post(OLLAMA_API_URL, json=payload)
+        response.raise_for_status()  # Raise an error for bad responses
+
+        # Extract the content from the response
+        response_data = response.json()
+        natural_response = response_data.get('message', {}).get('content', '')
+
+        return natural_response
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error connecting to Ollama API: {e}")
+        return "Sorry, I couldn't process your request."
+
 
 if __name__ == '__main__':
     app.run(debug=True)
