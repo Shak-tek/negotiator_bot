@@ -14,35 +14,46 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Store conversation history and attempts
 conversation_history = [] 
 negotiation_attempts = 0  
+negotiation_closed = False  # Track if the negotiation has ended
 LAST_NEGOTIATED_PRICE = 1500  
 
-MODEL= "llama3.2"
+MODEL= "llama3.1:8b"
 
 # Constants
 MAX_ATTEMPTS = 5  
 MIN_PRICE = 1200 
 ACTUAL_PRICE = 1500
 CURRENCY = "GBP"
+COMPANY_NAME = "Elite Wheels"
 OLLAMA_API_URL = 'http://localhost:11434/api/chat'  # Adjust if necessary
 
+
 def get_ollama_response(user_message):
-    global negotiation_attempts, LAST_NEGOTIATED_PRICE
+    global negotiation_attempts, LAST_NEGOTIATED_PRICE, negotiation_closed
     
+    if negotiation_closed:
+        return {
+            'response': "The negotiation has ended. No more offers can be made.",
+            'last_negotiated_price': LAST_NEGOTIATED_PRICE,
+            'show_buttons': False
+        }
     logging.info(f"last negotiated price: {LAST_NEGOTIATED_PRICE}")
     conversation_history.append({"role": "user", "content": user_message})
     user_offer = extract_price_from_message(user_message)
 
     if user_message == "Deal!":
         bot_message = finalize_negotiation(LAST_NEGOTIATED_PRICE, close_offer=True)
+        negotiation_closed = True  # Close the negotiation
         return {
             'response': bot_message,
             'last_negotiated_price': LAST_NEGOTIATED_PRICE,
             'show_buttons': False
         }
     elif user_message == "No Deal!":
-        bot_message = generate_natural_response("Sorry that we couldn't reach an agreement. Better luck next time!")
+        bot_message = ("Sorry that we couldn't reach an agreement. Better luck next time!")
+        negotiation_closed = True  # Close the negotiation
         return {
-            'response': bot_message,
+            'response': generate_natural_response(bot_message),
             'last_negotiated_price': LAST_NEGOTIATED_PRICE,
             'show_buttons': False
         }
@@ -59,6 +70,7 @@ def get_ollama_response(user_message):
 
     # Check if negotiation attempts have exceeded MAX_ATTEMPTS
     if negotiation_attempts >= MAX_ATTEMPTS:
+        negotiation_closed = True  # Close the negotiation
         return {
             'response': generate_natural_response(f"We've reached the maximum negotiation attempts. Our final price is {negotiator_price} {CURRENCY}."),
             'last_negotiated_price': negotiator_price,
@@ -85,14 +97,16 @@ def get_ollama_response(user_message):
             LAST_NEGOTIATED_PRICE = bot_price
         conversation_history.append({"role": "assistant", "content": bot_message})
 
-        bot_intent = classify_intent(user_message, bot_message)
+        user_intent = classify_user_intent(user_message, bot_message)
         logging.info(f'user_message is {user_message}')
         logging.info(f'bot_message is {bot_message}')
-        logging.info(f'bot intent is {bot_intent}')
-
-        if bot_intent == "acceptance" and negotiation_attempts > 1:
+        logging.info(f'User intent is {user_intent}')
+        if user_intent == "rejection":
+            negotiation_closed = True
+        if user_intent == "acceptance" and negotiation_attempts > 1:
+            negotiation_closed = True  # Close the negotiation
             bot_message = finalize_negotiation(LAST_NEGOTIATED_PRICE, close_offer=True)
-            return {'response': bot_message, 'show_buttons': False}
+            return {'response': generate_natural_response(bot_message), 'show_buttons': False}
 
         negotiation_attempts += 1
         return {'response': bot_message, 'last_negotiated_price': LAST_NEGOTIATED_PRICE, 'show_buttons': False}
@@ -124,9 +138,9 @@ def finalize_negotiation(last_price, close_offer=False):
         bot_message = "No deal reached. Thank you for your time!"
 
     reset_conversation()
-    return generate_natural_response(bot_message)
+    return bot_message
 
-def classify_intent(user_message=None, bot_message=None):
+def classify_user_intent(user_message=None, bot_message=None):
     """
     Classify the intent based on both user and bot messages using the Llama model.
     """
@@ -158,7 +172,7 @@ def classify_intent(user_message=None, bot_message=None):
         # Extract the intent from the bot's response
         if 'message' in bot_response and 'content' in bot_response['message']:
             classified_intent = bot_response['message']['content'].strip().lower()
-
+            logging.info(f'Classified Intent is {classified_intent}')
             # Map the response to predefined intents
             if "acceptance" in classified_intent:
                 return "acceptance"
@@ -173,6 +187,54 @@ def classify_intent(user_message=None, bot_message=None):
         logging.error(f"Error classifying intent with Ollama API: {e}")
         return "unknown"
 
+def classify_bot_intent(user_message=None, bot_message=None):
+    """
+    Classify the intent based on both user and bot messages using the Llama model.
+    """
+    # Ensure both messages are provided
+    if not user_message or not bot_message:
+        return "unknown"
+
+    # Add both user and bot messages to the payload for the Llama model to classify
+    conversation_history = [
+        {"role": "system", "content": f"Classify the assistant's intent in a price negotiation. Consider both the {user_message} and the {bot_message}. Determine if the assistant accepts, rejects, or is still negotiate. If the {bot_message} contains a counter price then it should be considered a negotiation. If the assistant accepts the price then it's an acceptance. Only respond with a acceptance, rejection, negotiation and unclear."},
+        {"role": "user", "content": user_message},
+        {"role": "assistant", "content": bot_message}
+    ]
+
+    payload = {
+        "model": MODEL,  # Replace with the correct model name
+        "stream": False,
+        "messages": conversation_history
+    }
+
+    try:
+        # Send the classification request to the Llama API
+        response = requests.post(OLLAMA_API_URL, json=payload)
+        response.raise_for_status()
+
+        # Parse the response from the Llama model
+        bot_response = response.json()
+
+        # Extract the intent from the bot's response
+        if 'message' in bot_response and 'content' in bot_response['message']:
+            classified_intent = bot_response['message']['content'].strip().lower()
+            logging.info(f'bot intent is {classified_intent}')
+            # Map the response to predefined intents
+            if "acceptance" in classified_intent:
+                return "acceptance"
+            elif "rejection" in classified_intent:
+                return "rejection"
+            elif "negotiation" in classified_intent:
+                return "negotiation"
+            else:
+                return "unknown"
+
+    except Exception as e:
+        logging.error(f"Error classifying intent with Ollama API: {e}")
+        return "unknown"
+
+
 def initialize_ollama_response(user_message):
     global negotiation_attempts, LAST_NEGOTIATED_PRICE
     conversation_history.clear()
@@ -181,7 +243,7 @@ def initialize_ollama_response(user_message):
     first_discounted_price = generate_random_discount(ACTUAL_PRICE)
     conversation_history.append({
         "role": "system",
-        "content": f"You are a smart and suave price negotiator who doesn't get detracted from his purpose. You are selling a set of 4 wheels for {ACTUAL_PRICE} {CURRENCY}. Start by always offering a price of {first_discounted_price} first. You should negotiate down to no less than {MIN_PRICE} {CURRENCY} after multiple attempts. The user can offer up to 5 times. If the user's offer is within 10% of the user's price, immediately accept. if the offer is more than the one you offered before, ask te user if they made a typo or something. Go a bit lower the next time you offer a price. Don't mention the price that the user offered and never go below what the user offered. Always offer price in {CURRENCY} and don't mention the discount amount. If the user accepts your price just accept it. Don't fall for low ballers who offer way too low of a price at start."
+        "content": f"You are a friendly and suave price negotiator working for {COMPANY_NAME}. You are selling a set of 4 wheels for {ACTUAL_PRICE} {CURRENCY}. Start by always offering a price of {first_discounted_price} first. You should negotiate down to no less than {MIN_PRICE} {CURRENCY} after multiple attempts. The user can offer up to 5 times. If the user's offer is within 10% of the user's price, immediately accept. Go a bit lower the next time you offer a price. Don't mention the price that the user offered. Never go below the price that the user offered. Always offer price in {CURRENCY} and don't mention the discount amount. If the user accepts your price just accept it."
     })
     logging.info(f"Ollama Initialized: {LAST_NEGOTIATED_PRICE}")
 
@@ -207,6 +269,7 @@ def chatbot_response():
 
 @app.route('/initialize', methods=['POST'])
 def chatbot_initialize():
+    negotiation_closed = False  # Track if the negotiation has ended
     data = request.get_json()
     user_message = data['message']
     bot_response = initialize_ollama_response(user_message)  # Adjust to initialize with Ollama
@@ -233,8 +296,8 @@ def generate_natural_response(prompt):
         "stream": False,
         "messages": [
             {
-                "role": "user",
-                "content": f"Output the following sentence as something natural sounding: {prompt}"
+                "role": "assistant",
+                "content": f"Output the following sentence as something a suave  negotiator would say: {prompt}"
             }
         ]
     }
@@ -246,8 +309,9 @@ def generate_natural_response(prompt):
         # Extract the content from the response
         response_data = response.json()
         natural_response = response_data.get('message', {}).get('content', '')
-
-        return natural_response
+        # Extract the intent from the bot's response
+        if 'message' in natural_response and 'content' in natural_response['message']:
+            return natural_response['message']['content'].strip().lower()
 
     except requests.exceptions.RequestException as e:
         print(f"Error connecting to Ollama API: {e}")
