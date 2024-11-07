@@ -37,21 +37,28 @@ def get_ollama_response(user_message):
             'last_negotiated_price': LAST_NEGOTIATED_PRICE,
             'show_buttons': False
         }
+
     logging.info(f"last negotiated price: {LAST_NEGOTIATED_PRICE}")
     conversation_history.append({"role": "user", "content": user_message})
-    user_offer = extract_price_from_message(user_message)
+    user_offer = extract_price_from_message(user_message, 'user')
 
-    if user_message == "Deal!":
+    # Classify user's intent before generating assistant's response
+    user_intent = classify_user_intent(user_message)
+    logging.info(f"User intent: {user_intent}")
+
+    # Handle user's acceptance or rejection before calling the assistant's response
+    if user_intent == "acceptance":
+        negotiation_closed = True
         bot_message = finalize_negotiation(LAST_NEGOTIATED_PRICE, close_offer=True)
-        negotiation_closed = True  # Close the negotiation
+        logging.info(f"Finalized negotiation with price: {LAST_NEGOTIATED_PRICE}")
         return {
-            'response': bot_message,
+            'response': generate_natural_response(bot_message),
             'last_negotiated_price': LAST_NEGOTIATED_PRICE,
             'show_buttons': False
         }
-    elif user_message == "No Deal!":
+    elif user_intent == "rejection":
+        negotiation_closed = True
         bot_message = "Sorry that we couldn't reach an agreement. Better luck next time!"
-        negotiation_closed = True  # Close the negotiation
         return {
             'response': generate_natural_response(bot_message),
             'last_negotiated_price': LAST_NEGOTIATED_PRICE,
@@ -60,17 +67,17 @@ def get_ollama_response(user_message):
 
     negotiator_price = LAST_NEGOTIATED_PRICE if LAST_NEGOTIATED_PRICE is not None else ACTUAL_PRICE
 
+    # Check if the user's offer is acceptable
     if user_offer is not None and negotiator_price is not None:
         if abs(user_offer - negotiator_price) <= (0.02 * negotiator_price):
-            # Update LAST_NEGOTIATED_PRICE to user's offer since we're accepting it
             LAST_NEGOTIATED_PRICE = user_offer
-            bot_message = generate_natural_response(
-                f"Congratulations! Your offer of {user_offer} {CURRENCY} is very close to our price of {negotiator_price} {CURRENCY} so We'll accept it. Do we got a deal?"
-            )
+            negotiation_closed = True
+            bot_message = finalize_negotiation(LAST_NEGOTIATED_PRICE, close_offer=True)
+            logging.info(f"User's offer accepted: {LAST_NEGOTIATED_PRICE}")
             return {
-                'response': bot_message,
+                'response': generate_natural_response(bot_message),
                 'last_negotiated_price': LAST_NEGOTIATED_PRICE,
-                'show_buttons': True
+                'show_buttons': False
             }
 
     if negotiation_attempts >= MAX_ATTEMPTS:
@@ -84,6 +91,7 @@ def get_ollama_response(user_message):
             'show_buttons': True
         }
 
+    # Proceed to generate assistant's response
     try:
         payload = {
             "model": MODEL,
@@ -97,41 +105,37 @@ def get_ollama_response(user_message):
         bot_message = bot_response['message']['content'].strip()
         logging.info(f"Bot's message: {bot_message}")
         logging.info(f"Bot's response: {bot_response}")
-        bot_price = extract_price_from_message(bot_message)
+        bot_price = extract_price_from_message(bot_message, 'assistant')
         logging.info(f"Price extracted from bot response: {bot_price}")
 
         conversation_history.append({"role": "assistant", "content": bot_message})
 
-        # Classify intents
-        user_intent = classify_user_intent(user_message)
+        # Classify assistant's intent
         assistant_intent = classify_assistant_intent(bot_message)
-        
+        logging.info(f"Assistant intent: {assistant_intent}")
+
         # Update LAST_NEGOTIATED_PRICE if bot provided a new price
         if bot_price is not None:
             LAST_NEGOTIATED_PRICE = bot_price
+            logging.info(f"Updated LAST_NEGOTIATED_PRICE to {LAST_NEGOTIATED_PRICE}")
+            
+        if user_offer is not None:
+            if abs(user_offer - negotiator_price) <= (0.02 * negotiator_price):
+                LAST_NEGOTIATED_PRICE = user_offer
+                negotiation_closed = True
+                bot_message = finalize_negotiation(LAST_NEGOTIATED_PRICE, close_offer=True)
+                logging.info(f"User's offer accepted: {LAST_NEGOTIATED_PRICE}")
+                return {
+                    'response': generate_natural_response(bot_message),
+                    'last_negotiated_price': LAST_NEGOTIATED_PRICE,
+                    'show_buttons': False
+                }
 
-        # Check if the assistant has accepted the user's offer
+        # Handle assistant's acceptance
         if assistant_intent == "acceptance":
-            if user_offer is not None:
-                LAST_NEGOTIATED_PRICE = user_offer  # Update to user's offer upon acceptance
-            # Return the assistant's acceptance message
-            return {
-                'response': bot_message,
-                'last_negotiated_price': LAST_NEGOTIATED_PRICE,
-                'show_buttons': False
-            }
-        elif user_intent == "acceptance":
             negotiation_closed = True
             bot_message = finalize_negotiation(LAST_NEGOTIATED_PRICE, close_offer=True)
             logging.info(f"Finalized negotiation with price: {LAST_NEGOTIATED_PRICE}")
-            return {
-                'response': generate_natural_response(bot_message),
-                'last_negotiated_price': LAST_NEGOTIATED_PRICE,
-                'show_buttons': False
-            }
-        elif user_intent == "rejection":
-            negotiation_closed = True
-            bot_message = "Sorry that we couldn't reach an agreement. Better luck next time!"
             return {
                 'response': generate_natural_response(bot_message),
                 'last_negotiated_price': LAST_NEGOTIATED_PRICE,
@@ -152,11 +156,29 @@ def get_ollama_response(user_message):
             'show_buttons': False
         }
 
-def extract_price_from_message(message):
+def extract_price_from_message(message, speaker):
     """
     Extract the most relevant price from the message using the Ollama API.
     """
-    logging.info(f"Extracting price from message: {message}")
+    logging.info(f"Extracting price from message from {speaker}: {message}")
+
+    if speaker == 'user':
+        system_prompt = (
+            "You are an assistant that extracts the latest price offered or suggested by the user in a negotiation message. "
+            "Given the user's message, identify the latest price offered or suggested by the user. "
+            "Respond with only the numerical value of that price. "
+            "Do not include any additional text, currency symbols, or other numbers. If there is no price mentioned, respond with 'No price found'."
+        )
+    elif speaker == 'assistant':
+        system_prompt = (
+            "You are an assistant that extracts the latest price offered or suggested by the assistant in a negotiation message. "
+            "Given the assistant's message, identify the latest price offered or suggested by the assistant. "
+            "Respond with only the numerical value of that price. "
+            "Do not include any additional text, currency symbols, or other numbers. If there is no price mentioned, respond with 'No price found'."
+        )
+    else:
+        logging.error("Invalid speaker specified.")
+        return None
 
     payload = {
         "model": MODEL,
@@ -164,12 +186,7 @@ def extract_price_from_message(message):
         "messages": [
             {
                 "role": "system",
-                "content": (
-                    "You are an assistant that extracts the most relevant price from a negotiation message. "
-                    "Given the user's message, identify the latest price offered or suggested by the user. "
-                    "Respond with only the numerical value of that price. "
-                    "Do not include any additional text, currency symbols, or other numbers. If there is no price mentioned, respond with 'No price found'."
-                )
+                "content": system_prompt
             },
             {"role": "user", "content": message}
         ]
@@ -191,7 +208,7 @@ def extract_price_from_message(message):
 
         # Remove any non-numeric characters
         extracted_text = extracted_text.replace(',', '').strip()
-        
+
         # Attempt to convert the extracted text to a float
         try:
             price = float(extracted_text)
