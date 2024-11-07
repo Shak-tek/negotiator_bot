@@ -65,7 +65,7 @@ def get_ollama_response(user_message):
             # Update LAST_NEGOTIATED_PRICE to user's offer since we're accepting it
             LAST_NEGOTIATED_PRICE = user_offer
             bot_message = generate_natural_response(
-                f"Congratulations! Your offer of {user_offer} {CURRENCY} is very close to our price of {negotiator_price} {CURRENCY}."
+                f"Congratulations! Your offer of {user_offer} {CURRENCY} is very close to our price of {negotiator_price} {CURRENCY} so We'll accept it. Do we got a deal?"
             )
             return {
                 'response': bot_message,
@@ -105,7 +105,7 @@ def get_ollama_response(user_message):
         # Classify intents
         user_intent = classify_user_intent(user_message)
         assistant_intent = classify_assistant_intent(bot_message)
-
+        
         # Update LAST_NEGOTIATED_PRICE if bot provided a new price
         if bot_price is not None:
             LAST_NEGOTIATED_PRICE = bot_price
@@ -113,7 +113,7 @@ def get_ollama_response(user_message):
         # Check if the assistant has accepted the user's offer
         if assistant_intent == "acceptance":
             if user_offer is not None:
-                LAST_NEGOTIATED_PRICE = user_offer
+                LAST_NEGOTIATED_PRICE = user_offer  # Update to user's offer upon acceptance
             # Return the assistant's acceptance message
             return {
                 'response': bot_message,
@@ -153,24 +153,66 @@ def get_ollama_response(user_message):
         }
 
 def extract_price_from_message(message):
-    """Extract the lowest price from the message, looking for patterns like '£<price>', '<price> GBP', or just a number."""
+    """
+    Extract the most relevant price from the message using the Ollama API.
+    """
+    logging.info(f"Extracting price from message: {message}")
+
+    payload = {
+        "model": MODEL,
+        "stream": False,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an assistant that extracts the most relevant price from a negotiation message. "
+                    "Given the user's message, identify the latest price offered or suggested by the user. "
+                    "Respond with only the numerical value of that price. "
+                    "Do not include any additional text, currency symbols, or other numbers. If there is no price mentioned, respond with 'No price found'."
+                )
+            },
+            {"role": "user", "content": message}
+        ]
+    }
+
     try:
-        logging.info(f"Extracting price from message: {message}")
+        response = requests.post(OLLAMA_API_URL, json=payload)
+        response.raise_for_status()
+        response_data = response.json()
+        logging.info(f"Ollama API response in extract_price_from_message: {response_data}")
+
+        extracted_text = response_data.get('message', {}).get('content', '').strip()
+        logging.info(f"Extracted text: {extracted_text}")
+
+        # Check if the assistant indicates no price was found
+        if 'no price found' in extracted_text.lower():
+            logging.info("No price found in the message.")
+            return None
+
+        # Remove any non-numeric characters
+        extracted_text = extracted_text.replace(',', '').strip()
         
-        # Adjusted regex to match optional '£' or 'GBP', as well as standalone numbers
-        prices = re.findall(r'£?\s*(\d+(?:\.\d+)?)\s*GBP?|(\d+(?:\.\d+)?)', message)
-        logging.info(f"Prices found: {prices}")
-        
-        # Flatten and convert extracted prices to float
-        prices = [float(price) for price_pair in prices for price in price_pair if price]
-        
-        if prices:
-            logging.info(f"Prices after conversion: {prices}")
-            return min(prices)
+        # Attempt to convert the extracted text to a float
+        try:
+            price = float(extracted_text)
+            logging.info(f"Extracted price: {price}")
+            return price
+        except ValueError:
+            # If multiple numbers are present, extract them and choose the most relevant one
+            numbers = re.findall(r'\d+(?:\.\d+)?', extracted_text)
+            logging.info(f"Numbers found in extracted text: {numbers}")
+            if numbers:
+                # Assuming the last number is the most relevant price
+                price = float(numbers[-1])
+                logging.info(f"Selected price: {price}")
+                return price
+            else:
+                logging.error("No valid numbers found in the extracted text.")
+                return None
+
     except Exception as e:
-        logging.error(f"Error extracting price: {e}")
-    
-    return None
+        logging.error(f"Error extracting price using Ollama API: {e}", exc_info=True)
+        return None
 
 def finalize_negotiation(last_price, close_offer=False):
     """
@@ -199,9 +241,9 @@ def classify_user_intent(user_message):
                 "Given the user's latest message, classify the intent as 'acceptance', 'rejection', or 'negotiation'. "
                 "Only respond with the intent.\n\n"
                 "Guidelines:\n"
-                "- If the user agrees to the price or says phrases like 'Yes', 'Ok sure', 'Deal', classify as 'acceptance'.\n"
+                "- If the user agrees to the price or says phrases like 'Yes', 'sure', 'Deal', classify as 'acceptance'.\n"
                 "- If the user declines or says phrases like 'No', 'Not interested', 'I don't think so', classify as 'rejection'.\n"
-                "- If the user makes a counteroffer or continues negotiating, classify as 'negotiation'.\n"
+                "- If the user makes a counteroffer (gives a price) or continues negotiating, classify as 'negotiation'.\n"
                 "- If the intent is unclear, classify as 'unknown'."
             )
         },
@@ -249,13 +291,13 @@ def classify_assistant_intent(bot_message):
                 "Given the assistant's latest message, classify the intent as 'acceptance', 'rejection', or 'negotiation'. "
                 "Only respond with the intent.\n\n"
                 "Guidelines:\n"
-                "- If the assistant accepts the user's offer or says phrases like 'Deal', 'Agreed', 'We have a deal', classify as 'acceptance'.\n"
+                "- If the assistant accepts the user's offer or says phrases like 'Deal', 'Agreed', 'ok', 'alright', 'We have a deal', classify as 'acceptance'.\n"
                 "- If the assistant declines the negotiation or says phrases like 'We cannot offer a better price', 'Sorry, that's our final offer', classify as 'rejection'.\n"
                 "- If the assistant makes a counteroffer, suggests a new price, continues negotiating, or asks the user what it thinks then classify as 'negotiation'.\n"
                 "- If the intent is unclear, classify as 'unknown'."
             )
         },
-        {"role": "assistant", "content": bot_message}
+        {"role": "user", "content": bot_message}
     ]
 
     payload = {
@@ -290,15 +332,16 @@ def initialize_ollama_response(user_message):
     conversation_history.clear()
     negotiation_attempts = 0
     negotiation_closed = False  # Reset negotiation closed flag
-    LAST_NEGOTIATED_PRICE = ACTUAL_PRICE  # Reset negotiator's offer
     first_discounted_price = generate_random_discount(ACTUAL_PRICE)
+    LAST_NEGOTIATED_PRICE = first_discounted_price  # **Set LAST_NEGOTIATED_PRICE to assistant's first offer**
     conversation_history.append({
         "role": "system",
         "content": (
-            f"You are a friendly and suave brittish price negotiator working for {COMPANY_NAME}. "
+            f"You are a friendly and suave British price negotiator working for {COMPANY_NAME}. "
             f"You are selling a set of 4 wheels for {ACTUAL_PRICE} {CURRENCY}. "
             f"Start by always offering a price of {first_discounted_price} {CURRENCY} first. "
             f"You should negotiate down to no less than {MIN_PRICE} {CURRENCY} after multiple attempts. "
+            f"If the user's offer is less than 50% of {ACTUAL_PRICE} {CURRENCY} tell them that we won't have a deal with this kind of offer so please try to do better. "
             "The user can offer up to 5 times. If the user's offer is within 10% of your price, immediately accept. "
             "Go a bit lower the next time you offer a price. Don't mention the price that the user offered. "
             "Never go below the price that the user offered. "
@@ -317,7 +360,7 @@ def reset_conversation():
     global conversation_history, negotiation_attempts, LAST_NEGOTIATED_PRICE
     conversation_history.clear()
     negotiation_attempts = 0
-    LAST_NEGOTIATED_PRICE = ACTUAL_PRICE  # Reset the negotiator's offer
+    LAST_NEGOTIATED_PRICE = None  # **Reset LAST_NEGOTIATED_PRICE to None**
 
 @app.route('/chatbot', methods=['POST'])
 def chatbot_response():
@@ -337,7 +380,7 @@ def generate_random_discount(original_price):
     discount_percentage = random.uniform(2, 5)
     discount = round(discount_percentage, 0)
     discounted_price = original_price * (1 - discount / 100)
-    return discounted_price
+    return round(discounted_price, 2)  # **Ensure the price is rounded to two decimal places**
   
 def generate_natural_response(prompt):
     """
@@ -348,8 +391,8 @@ def generate_natural_response(prompt):
         "stream": False,
         "messages": [
             {
-                "role": "assistant",
-                "content": f"Output the following sentence as something a suave negotiator would say: {prompt}"
+                "role": "user",
+                "content": f"Output the following sentence as something a human would say without adding sentences that might change the meaning: {prompt}"
             }
         ]
     }
@@ -361,6 +404,7 @@ def generate_natural_response(prompt):
         # Extract the content from the response
         response_data = response.json()
         natural_response = response_data.get('message', {}).get('content', '').strip()
+        logging.info(f"Ollama API response in generate_natural_response: {response_data}")
         return natural_response
 
     except requests.exceptions.RequestException as e:
